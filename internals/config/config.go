@@ -26,7 +26,7 @@ func LoadConfig() (*Config, error) {
 	}
 	apiURL := os.Getenv("PALABRA_API_URL")
 	if apiURL == "" {
-		apiURL = "https://api.palabra.dev/session-storage/session"
+		apiURL = "https://api.palabra.ai/session-storage/session"
 	}
 
 	return &Config{

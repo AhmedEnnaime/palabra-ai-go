@@ -1,13 +1,15 @@
 package palabra
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"time"
 
-	"github.com/pion/webrtc/v3"
-	"github.com/pion/webrtc/v3/pkg/media"
+	lksdk "github.com/livekit/server-sdk-go/v2"
+	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 )
 
 type PalabraClient struct {
@@ -15,15 +17,15 @@ type PalabraClient struct {
 	ClientSecret string
 	APIUrl       string
 	Session      *SessionData
-	PeerConn     *webrtc.PeerConnection
-	DataChannel  *webrtc.DataChannel
+	Room         *lksdk.Room
+	AudioTrack   *lksdk.LocalSampleTrack
 }
 
 func NewPalabraClient(clientID, clientSecret string) *PalabraClient {
 	return &PalabraClient{
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
-		APIUrl:       "https://api.palabra.dev/session-storage/session",
+		APIUrl:       "https://api.palabra.ai/session-storage/session",
 	}
 }
 
@@ -53,96 +55,116 @@ func (pc *PalabraClient) CreateSession() error {
 	return nil
 }
 
-func (pc *PalabraClient) ConnectToWebRTC() error {
-	config := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
+func (pc *PalabraClient) ConnectWebRTC() error {
+	if pc.Session == nil {
+		return fmt.Errorf("session not created yet")
+	}
+
+	log.Println("Connecting to WebRTC room...")
+	log.Printf("  Room: %s", pc.Session.WebRTCRoomName)
+	log.Printf("  URL: %s", pc.Session.WebRTCURL)
+	log.Println("  Note: Connection may take 15-30 seconds for ICE negotiation...")
+	roomCallback := &lksdk.RoomCallback{
+		ParticipantCallback: lksdk.ParticipantCallback{
+			OnDataPacket: func(data lksdk.DataPacket, params lksdk.DataReceiveParams) {
+				if userPacket, ok := data.(*lksdk.UserDataPacket); ok {
+					pc.handleTranscriptionMessage(userPacket.Payload)
+				}
+			},
+			OnTrackSubscribed: func(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
+				log.Printf("✓ Received track: %s (type: %s)", track.ID(), track.Kind())
+				go func() {
+					packetCount := 0
+					buf := make([]byte, 1500)
+					for {
+						_, _, readErr := track.Read(buf)
+						if readErr != nil {
+							log.Printf("Track read ended: %v", readErr)
+							return
+						}
+						packetCount++
+						if packetCount%100 == 0 {
+							log.Printf("Received %d audio packets", packetCount)
+						}
+					}
+				}()
 			},
 		},
+		OnDisconnected: func() {
+			log.Println("✗ Room disconnected")
+		},
+		OnReconnecting: func() {
+			log.Println("⟳ Reconnecting...")
+		},
+		OnReconnected: func() {
+			log.Println("✓ Reconnected")
+		},
 	}
-	peerConnection, err := webrtc.NewPeerConnection(config)
-	if err != nil {
-		return fmt.Errorf("failed to create peer connection: %w", err)
-	}
-	pc.PeerConn = peerConnection
-	dataChannel, err := peerConnection.CreateDataChannel("data", nil)
-	if err != nil {
-		return fmt.Errorf("failed to create data channel: %w", err)
-	}
-	pc.DataChannel = dataChannel
-	dataChannel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		pc.handleTranscriptionMessage(msg.Data)
-	})
-	dataChannel.OnOpen(func() {
-		log.Println("✓ Data channel opened")
-	})
-	dataChannel.OnClose(func() {
-		log.Println("✗ Data channel closed")
-	})
-	peerConnection.OnTrack(func(tr *webrtc.TrackRemote, r *webrtc.RTPReceiver) {
-		log.Printf("✓ Received track: %s (type: %s)", tr.ID(), tr.Kind())
-		go func() {
-			packetCount := 0
-			for {
-				rtpPacket, _, readErr := tr.ReadRTP()
-				if readErr != nil {
-					log.Printf("Track read ended: %v", readErr)
-					return
-				}
-				if rtpPacket != nil {
-					packetCount++
-					if packetCount%100 == 0 {
-						log.Printf("Received %d audio packets (latest: %d bytes)", packetCount, len(rtpPacket.Payload))
-					}
-				}
-			}
-		}()
-	})
-	peerConnection.OnICEConnectionStateChange(func(state webrtc.ICEConnectionState) {
-		log.Printf("ICE Connection State: %s", state.String())
-	})
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		log.Printf("Peer Connection State: %s", state.String())
-	})
+	room, err := lksdk.ConnectToRoomWithToken(
+		pc.Session.WebRTCURL,
+		pc.Session.Publisher,
+		roomCallback,
+		lksdk.WithAutoSubscribe(true),
+	)
 
-	log.Println("✓ WebRTC connection initialized")
+	if err != nil {
+		return fmt.Errorf("failed to connect to room: %w", err)
+	}
+
+	pc.Room = room
+	log.Println("✓ WebRTC connection initiated")
+	log.Println("Waiting for connection to establish...")
+	maxWait := 30 * time.Second
+	checkInterval := 500 * time.Millisecond
+	elapsed := time.Duration(0)
+
+	for elapsed < maxWait {
+		if pc.Room.LocalParticipant != nil {
+			log.Println("✓ Local participant ready")
+			break
+		}
+		time.Sleep(checkInterval)
+		elapsed += checkInterval
+	}
+
+	if pc.Room.LocalParticipant == nil {
+		pc.Room.Disconnect()
+		return fmt.Errorf("connection timeout - local participant not ready after %v", maxWait)
+	}
+	log.Println("Allowing ICE connection to stabilize...")
+	time.Sleep(3 * time.Second)
+
+	log.Println("✓ WebRTC connection ready")
 	return nil
 }
 
-func (pc *PalabraClient) publishAudioTrack() error {
-	audioTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus},
-		"audio",
-		"pion-audio",
-	)
+func (pc *PalabraClient) PublishAudioTrack() error {
+	if pc.Room == nil {
+		return fmt.Errorf("room not connected")
+	}
+	track, err := lksdk.NewLocalSampleTrack(webrtc.RTPCodecCapability{
+		MimeType:  webrtc.MimeTypeOpus,
+		ClockRate: 48000,
+		Channels:  1,
+	})
 	if err != nil {
 		return fmt.Errorf("failed to create audio track: %w", err)
 	}
-	retpSender, err := pc.PeerConn.AddTrack(audioTrack)
-	if err != nil {
-		return fmt.Errorf("failed to add track: %w", err)
+	pc.AudioTrack = track
+	if _, err = pc.Room.LocalParticipant.PublishTrack(track, &lksdk.TrackPublicationOptions{
+		Name: "audio",
+	}); err != nil {
+		return fmt.Errorf("failed to publish track: %w", err)
 	}
-	go func() {
-		rtcpBuf := make([]byte, 1500)
-		for {
-			if _, _, rtcpErr := retpSender.Read(rtcpBuf); rtcpErr != nil {
-				return
-			}
-		}
-	}()
+
 	log.Println("✓ Audio track published")
 	return nil
 }
 
-func (pc *PalabraClient) SendAudioSample(track *webrtc.TrackLocalStaticSample, data []byte, duration time.Duration) error {
-	return track.WriteSample(media.Sample{
-		Data:     data,
-		Duration: duration,
-	})
-}
-
 func (pc *PalabraClient) StartTranslation(sourceLang, targetLang string) error {
+	if pc.Room == nil {
+		return fmt.Errorf("room not connected")
+	}
 	config := TranslationConfig{
 		MessageType: "set_task",
 		Data: TranslationConfigData{
@@ -174,17 +196,8 @@ func (pc *PalabraClient) StartTranslation(sourceLang, targetLang string) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	maxAttempts := 30
-	for i := 0; i < maxAttempts; i++ {
-		if pc.DataChannel != nil && pc.DataChannel.ReadyState() == webrtc.DataChannelStateOpen {
-			break
-		}
-		if i == maxAttempts-1 {
-			return fmt.Errorf("data channel not open after %d seconds", maxAttempts)
-		}
-		time.Sleep(1 * time.Second)
-	}
-	err = pc.DataChannel.Send(configJSON)
+	dataPacket := lksdk.UserData(configJSON)
+	err = pc.Room.LocalParticipant.PublishDataPacket(dataPacket, lksdk.WithDataPublishReliable(true))
 	if err != nil {
 		return fmt.Errorf("failed to send config: %w", err)
 	}
@@ -228,18 +241,50 @@ func (pc *PalabraClient) handleTranscriptionMessage(data []byte) {
 	}
 }
 
+func (pc *PalabraClient) SendAudioSample(data []byte, duration time.Duration) error {
+	if pc.AudioTrack == nil {
+		return fmt.Errorf("audio track not created")
+	}
+	sample := media.Sample{
+		Data:     data,
+		Duration: duration,
+	}
+	return pc.AudioTrack.WriteSample(sample, nil)
+}
+
 func (pc *PalabraClient) Disconnect() error {
 	log.Println("Disconnecting...")
-	if pc.DataChannel != nil {
-		if err := pc.DataChannel.Close(); err != nil {
-			log.Printf("Warning: DataChannel close error: %v", err)
-		}
-	}
-	if pc.PeerConn != nil {
-		if err := pc.PeerConn.Close(); err != nil {
-			return fmt.Errorf("failed to close peer connection: %w", err)
-		}
+
+	if pc.Room != nil {
+		pc.Room.Disconnect()
 	}
 	log.Println("✓ Disconnected successfully")
 	return nil
+}
+
+func (pc *PalabraClient) WaitForConnection(ctx context.Context, timeout time.Duration) error {
+	if pc.Room == nil {
+		return fmt.Errorf("room not initialized")
+	}
+
+	start := time.Now()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			localParticipant := pc.Room.LocalParticipant
+			if localParticipant != nil {
+				log.Println("✓ Connection ready")
+				return nil
+			}
+
+			if time.Since(start) > timeout {
+				return fmt.Errorf("connection timeout after %v", timeout)
+			}
+		}
+	}
 }
