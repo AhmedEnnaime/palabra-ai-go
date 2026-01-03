@@ -276,14 +276,14 @@ func (pc *PalabraClient) handleTranscriptionMessage(data []byte) {
 			log.Printf("Failed to unmarshal transcription: %v", err)
 			return
 		}
-		log.Printf("📝 [PARTIAL] %s", transData.Transcription.Text)
+		log.Printf("[PARTIAL] %s", transData.Transcription.Text)
 	case "translated_transcription":
 		var transData TranscriptionData
 		if err := json.Unmarshal(msg.Data, &transData); err != nil {
 			log.Printf("Failed to unmarshal translation: %v", err)
 			return
 		}
-		log.Printf("🌐 [TRANSLATION-%s] %s",
+		log.Printf("[TRANSLATION-%s] %s",
 			transData.Transcription.Language,
 			transData.Transcription.Text)
 		log.Printf("TIP: Translation audio should be playing now!")
