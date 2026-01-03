@@ -22,10 +22,10 @@ func main() {
 
 	cfg, err := config.LoadConfig()
 	if err != nil {
-		log.Fatalf("❌ Failed to load config: %v", err)
+		log.Fatalf("Failed to load config: %v", err)
 	}
 	if err := cfg.Validate(); err != nil {
-		log.Fatalf("❌ Invalid configuration: %v", err)
+		log.Fatalf("Invalid configuration: %v", err)
 	}
 	log.Println("╔══════════════════════════════════════════════════════════╗")
 	log.Println("║         Palabra.ai Real-Time Translation Service        ║")
@@ -34,20 +34,20 @@ func main() {
 	log.Printf("API URL: %s\n", cfg.APIUrl)
 	if *runTest {
 		if err := test.RunIntegrationTest(cfg.ClientID, cfg.ClientSecret); err != nil {
-			log.Fatalf("❌ Integration test failed: %v", err)
+			log.Fatalf("Integration test failed: %v", err)
 		}
 		return
 	}
 
 	if *testLangs {
 		if err := test.TestMultipleLanguages(cfg.ClientID, cfg.ClientSecret); err != nil {
-			log.Fatalf("❌ Language test failed: %v", err)
+			log.Fatalf("Language test failed: %v", err)
 		}
 		return
 	}
 
 	if err := runApplication(cfg, *sourceLang, *targetLang); err != nil {
-		log.Fatalf("❌ Application error: %v", err)
+		log.Fatalf("Application error: %v", err)
 	}
 }
 
@@ -76,8 +76,8 @@ func runApplication(cfg *config.Config, sourceLang, targetLang string) error {
 	log.Println("\n╔══════════════════════════════════════════════════════════╗")
 	log.Println("║    Translation Service Running                           ║")
 	log.Println("╚══════════════════════════════════════════════════════════╝")
-	log.Println("\nℹ️  Press Ctrl+C to stop")
-	log.Println("ℹ️  Transcriptions and translations will appear below:")
+	log.Println("  Press Ctrl+C to stop")
+	log.Println(" Transcriptions and translations will appear below:")
 	log.Println("───────────────────────────────────────────────────────────")
 
 	sigChan := make(chan os.Signal, 1)
@@ -85,11 +85,11 @@ func runApplication(cfg *config.Config, sourceLang, targetLang string) error {
 	<-sigChan
 
 	log.Println("\n───────────────────────────────────────────────────────────")
-	log.Println("🛑 Shutdown signal received...")
+	log.Println("Shutdown signal received...")
 	if err := client.Disconnect(); err != nil {
 		log.Printf("⚠️  Warning: Error during disconnect: %v", err)
 	}
 
-	log.Println("\n✅ Application stopped successfully")
+	log.Println("\nApplication stopped successfully")
 	return nil
 }

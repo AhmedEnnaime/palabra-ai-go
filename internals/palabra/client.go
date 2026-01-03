@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"time"
 
@@ -19,6 +20,7 @@ type PalabraClient struct {
 	Session      *SessionData
 	Room         *lksdk.Room
 	AudioTrack   *lksdk.LocalSampleTrack
+	AudioChannel chan []byte
 }
 
 func NewPalabraClient(clientID, clientSecret string) *PalabraClient {
@@ -26,6 +28,7 @@ func NewPalabraClient(clientID, clientSecret string) *PalabraClient {
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		APIUrl:       "https://api.palabra.ai/session-storage/session",
+		AudioChannel: make(chan []byte, 100),
 	}
 }
 
@@ -34,6 +37,7 @@ func NewPalabraClientWithURL(clientID, clientSecret, apiURL string) *PalabraClie
 		ClientID:     clientID,
 		ClientSecret: clientSecret,
 		APIUrl:       apiURL,
+		AudioChannel: make(chan []byte, 100),
 	}
 }
 
@@ -49,7 +53,7 @@ func (pc *PalabraClient) CreateSession() error {
 		return fmt.Errorf("failed to create session: %w", err)
 	}
 	pc.Session = session
-	log.Printf("✓ Session created: Room=%s", session.WebRTCRoomName)
+	log.Printf(" Session created: Room=%s", session.WebRTCRoomName)
 	log.Printf("  WebRTC URL: %s", session.WebRTCURL)
 	log.Printf("  WS URL: %s", session.WSURL)
 	return nil
@@ -72,22 +76,11 @@ func (pc *PalabraClient) ConnectWebRTC() error {
 				}
 			},
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, publication *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				log.Printf("✓ Received track: %s (type: %s)", track.ID(), track.Kind())
-				go func() {
-					packetCount := 0
-					buf := make([]byte, 1500)
-					for {
-						_, _, readErr := track.Read(buf)
-						if readErr != nil {
-							log.Printf("Track read ended: %v", readErr)
-							return
-						}
-						packetCount++
-						if packetCount%100 == 0 {
-							log.Printf("Received %d audio packets", packetCount)
-						}
-					}
-				}()
+				log.Printf(" Received track: %s (type: %s, codec: %s)",
+					track.ID(),
+					track.Kind(),
+					track.Codec().MimeType)
+				go pc.readAudioTrack(track)
 			},
 		},
 		OnDisconnected: func() {
@@ -97,7 +90,7 @@ func (pc *PalabraClient) ConnectWebRTC() error {
 			log.Println("⟳ Reconnecting...")
 		},
 		OnReconnected: func() {
-			log.Println("✓ Reconnected")
+			log.Println(" Reconnected")
 		},
 	}
 	room, err := lksdk.ConnectToRoomWithToken(
@@ -112,7 +105,7 @@ func (pc *PalabraClient) ConnectWebRTC() error {
 	}
 
 	pc.Room = room
-	log.Println("✓ WebRTC connection initiated")
+	log.Println(" WebRTC connection initiated")
 	log.Println("Waiting for connection to establish...")
 	maxWait := 30 * time.Second
 	checkInterval := 500 * time.Millisecond
@@ -120,7 +113,7 @@ func (pc *PalabraClient) ConnectWebRTC() error {
 
 	for elapsed < maxWait {
 		if pc.Room.LocalParticipant != nil {
-			log.Println("✓ Local participant ready")
+			log.Println(" Local participant ready")
 			break
 		}
 		time.Sleep(checkInterval)
@@ -134,8 +127,64 @@ func (pc *PalabraClient) ConnectWebRTC() error {
 	log.Println("Allowing ICE connection to stabilize...")
 	time.Sleep(3 * time.Second)
 
-	log.Println("✓ WebRTC connection ready")
+	log.Println(" WebRTC connection ready")
 	return nil
+}
+
+func (pc *PalabraClient) readAudioTrack(track *webrtc.TrackRemote) {
+	log.Println("Starting audio track reader...")
+
+	packetCount := 0
+	opusPacketCount := 0
+	errorCount := 0
+
+	for {
+		rtpPacket, _, err := track.ReadRTP()
+		if err != nil {
+			if err == io.EOF {
+				log.Println("Audio track ended (EOF)")
+				return
+			}
+			errorCount++
+			if errorCount%100 == 0 {
+				log.Printf("Audio read error count: %d (last: %v)", errorCount, err)
+			}
+			continue
+		}
+
+		packetCount++
+		if packetCount%100 == 0 {
+			log.Printf("Received %d RTP packets, %d Opus packets forwarded", packetCount, opusPacketCount)
+		}
+		opusData := rtpPacket.Payload
+
+		if len(opusData) == 0 {
+			if packetCount < 10 {
+				log.Printf("Empty RTP payload in packet #%d", packetCount)
+			}
+			continue
+		}
+		if opusPacketCount < 3 {
+			log.Printf("Opus packet #%d: size=%d bytes, RTP seq=%d, timestamp=%d",
+				opusPacketCount+1,
+				len(opusData),
+				rtpPacket.SequenceNumber,
+				rtpPacket.Timestamp)
+		}
+		opusCopy := make([]byte, len(opusData))
+		copy(opusCopy, opusData)
+		select {
+		case pc.AudioChannel <- opusCopy:
+			opusPacketCount++
+			if opusPacketCount == 1 {
+				log.Println("First Opus packet sent to audio channel!")
+			}
+		default:
+			if opusPacketCount < 10 {
+				log.Printf("Audio channel full, dropping packet #%d", opusPacketCount)
+			}
+		}
+	}
 }
 
 func (pc *PalabraClient) PublishAudioTrack() error {
@@ -157,7 +206,7 @@ func (pc *PalabraClient) PublishAudioTrack() error {
 		return fmt.Errorf("failed to publish track: %w", err)
 	}
 
-	log.Println("✓ Audio track published")
+	log.Println(" Audio track published")
 	return nil
 }
 
@@ -202,7 +251,7 @@ func (pc *PalabraClient) StartTranslation(sourceLang, targetLang string) error {
 		return fmt.Errorf("failed to send config: %w", err)
 	}
 
-	log.Printf("✓ Translation started: %s -> %s", sourceLang, targetLang)
+	log.Printf(" Translation started: %s -> %s", sourceLang, targetLang)
 	return nil
 }
 
@@ -219,7 +268,8 @@ func (pc *PalabraClient) handleTranscriptionMessage(data []byte) {
 			log.Printf("Failed to unmarshal transcription: %v", err)
 			return
 		}
-		log.Printf("📝 [VALIDATED] %s", transData.Transcription.Text)
+		log.Printf("[VALIDATED] %s", transData.Transcription.Text)
+		log.Printf("TIP: You should hear translated audio shortly after seeing this!")
 	case "partial_transcription":
 		var transData TranscriptionData
 		if err := json.Unmarshal(msg.Data, &transData); err != nil {
@@ -236,8 +286,11 @@ func (pc *PalabraClient) handleTranscriptionMessage(data []byte) {
 		log.Printf("🌐 [TRANSLATION-%s] %s",
 			transData.Transcription.Language,
 			transData.Transcription.Text)
+		log.Printf("TIP: Translation audio should be playing now!")
 	default:
-		log.Printf("Received message type: %s", msg.MessageType)
+		if msg.MessageType != "" {
+			log.Printf("Received message type: %s", msg.MessageType)
+		}
 	}
 }
 
@@ -258,7 +311,15 @@ func (pc *PalabraClient) Disconnect() error {
 	if pc.Room != nil {
 		pc.Room.Disconnect()
 	}
-	log.Println("✓ Disconnected successfully")
+	if pc.AudioChannel != nil {
+		select {
+		case <-pc.AudioChannel:
+		default:
+			close(pc.AudioChannel)
+		}
+	}
+
+	log.Println(" Disconnected successfully")
 	return nil
 }
 
@@ -278,7 +339,7 @@ func (pc *PalabraClient) WaitForConnection(ctx context.Context, timeout time.Dur
 		case <-ticker.C:
 			localParticipant := pc.Room.LocalParticipant
 			if localParticipant != nil {
-				log.Println("✓ Connection ready")
+				log.Println(" Connection ready")
 				return nil
 			}
 
